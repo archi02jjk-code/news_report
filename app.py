@@ -2,7 +2,7 @@ import streamlit as st
 import feedparser
 from datetime import datetime
 import urllib.parse
-import re  # 👈 형식을 유연하게 파싱하기 위해 정규식 라이브러리 추가
+import re
 from google import genai
 
 # 웹페이지 기본 설정
@@ -22,51 +22,35 @@ st.sidebar.write("---")
 st.sidebar.header("⏰ 시스템 정보")
 st.sidebar.write(f"마지막 동기화: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
-# Gemini AI 분석 함수 (에러 방지 로직 강화)
-def analyze_news(title, raw_summary, api_key):
+# 단일 항목(요약 또는 시사점)을 개별 요청하는 안정화된 AI 함수
+def ask_gemini(title, raw_summary, mission_prompt, api_key):
     if not api_key:
-        return "⚠️ 사이드바에 Gemini API Key를 입력하시면 요약이 생성됩니다.", "⚠️ API Key를 입력하시면 시사점이 생성됩니다."
+        return "⚠️ 사이드바에 API Key를 입력해주세요."
     
     try:
         client = genai.Client(api_key=api_key)
         
         prompt = f"""
-        당신은 IT 및 빅데이터 분야 전문 수석 애널리스트입니다. 
-        아래 뉴스 기사의 제목과 내용을 바탕으로 핵심을 파악하여 일반 대중과 실무자가 읽기 쉽게 분석해 주세요.
+        당신은 IT 및 빅데이터 분야 전문 수석 애널리스트입니다.
+        아래 기사의 제목과 요약 내용을 바탕으로 지시사항을 수행해 주세요.
 
         기사 제목: {title}
-        기사 요약 내용: {raw_summary}
+        기사 내용: {raw_summary}
 
-        출력 형식은 반드시 아래 형식을 엄격히 지켜주세요. 대괄호 명칭 변경 금지:
-        [요약]: (기사의 핵심 사건과 사실 관계를 2~3문장으로 명확하게 요약)
-        [시사점]: (이 뉴스가 관련 시장, 기술 트렌드, 혹은 실무자에게 주는 의미나 시사점을 2~3문장으로 날카롭게 분석)
+        지시사항: {mission_prompt}
+        답변은 다른 군더더기 말(예: "네, 요약해드리겠습니다" 등) 없이 딱 지시사항에 대한 결과만 깔끔하게 출력하세요.
         """
         
+        # 서버 부하를 줄이기 위해 텍스트 전용 최적화 모델 사용
         response = client.models.generate_content(
             model='gemini-2.5-flash-lite',
             contents=prompt,
         )
-        
-        result = response.text
-        
-        # 💡 안전한 파싱 기법 도입: split 대신 정규식을 사용하여 대괄호나 마크다운 형태를 모두 잡아냅니다.
-        summary_match = re.search(r'(?:\[요약\]:|요약:|\*\*요약\*\*:?)(.*?)(?=(?:\[시사점\]:|시사점:|\*\*시사점\*\*:?)|$)', result, re.DOTALL)
-        insight_match = re.search(r'(?:\[시사점\]:|시사점:|\*\*시사점\*\*:?)(.*)', result, re.DOTALL)
-        
-        # 매칭 성공 시 공백을 제거하고 가져옴, 실패 시 전체 답변을 나누어 담음
-        ai_summary = summary_match.group(1).strip() if summary_match else ""
-        ai_insight = insight_match.group(1).strip() if insight_match else ""
-        
-        # 정규식 파싱마저 실패한 완전 비상 상황인 경우 예외를 띄우지 않고 AI 전체 답변을 가공해 노출
-        if not ai_summary and not ai_insight:
-            ai_summary = result[:len(result)//2]
-            ai_insight = result[len(result)//2:]
-            
-        return ai_summary, ai_insight
+        return response.text.strip()
         
     except Exception as e:
-        # 실제 어떤 에러가 나는지 디버깅하기 쉽도록 시스템 에러 메시지(str(e)) 노출로 변경
-        return f"요약 생성 실패 ({str(e)})", "시사점 분석 실패"
+        # 503 에러 발생 시 시스템 장애 메시지를 그대로 리턴하여 화면에 개별 표시되도록 함
+        return f"실패 ({str(e)})"
 
 # 구글 RSS 뉴스 수집 함수
 def get_news(keyword):
@@ -84,7 +68,7 @@ def get_news(keyword):
         })
     return news_list
 
-# 대시보드 화면 레이아웃 배치
+# 대시보드 화면 2열 레이아웃 배치
 col1, col2 = st.columns(2)
 
 with col1:
@@ -92,14 +76,30 @@ with col1:
     ai_news = get_news("인공지능 AI")
     
     for i, news in enumerate(ai_news):
-        with st.spinner(f"AI가 {i+1}번 기사 문맥 분석 중..."):
-            ai_summary, ai_insight = analyze_news(news['title'], news['raw_summary'], gemini_api_key)
+        # ⚠️ PDF 요구사항: 기사 번호와 제목을 대제목 형태로 먼저 배치
+        st.markdown(f"### {news['title']}")
         
-        st.markdown(f"### 기사 {i+1}")
-        st.markdown(f"**1. 제목:** {news['title']}")
-        st.markdown(f"**2. 요약:** {ai_summary}")
-        st.markdown(f"**3. 시사점:** {ai_insight}")
-        st.markdown(f"**4. 링크:** [🔗 뉴스 기사 보러가기]({news['link']})")
+        # 각 항목별 독립적 AI 호출로 503 에러 발생 시 해당 칸만 에러 메시지가 나오도록 격리
+        with st.spinner(f"AI가 요약문 생성 중..."):
+            summary_prompt = "이 기사의 핵심 사건과 사실 관계를 2~3문장으로 명확하게 요약해줘."
+            ai_summary = ask_gemini(news['title'], news['raw_summary'], summary_prompt, gemini_api_key)
+            
+        with st.spinner(f"AI가 시사점 분석 중..."):
+            insight_prompt = "이 뉴스가 관련 시장, 기술 트렌드, 혹은 실무자에게 주는 의미나 시사점을 2~3문장으로 날카롭게 분석해줘."
+            ai_insight = ask_gemini(news['title'], news['raw_summary'], insight_prompt, gemini_api_key)
+            
+        # ⚠️ PDF 요구사항에 맞춤 포맷 출력 (1. 요약 / 2. 시사점 / 링크)
+        if "실패" in ai_summary:
+            st.markdown(f"**1. 요약:** 요약 생성 {ai_summary}")
+        else:
+            st.markdown(f"**1. 요약:** {ai_summary}")
+            
+        if "실패" in ai_insight:
+            st.markdown(f"**2. 시사점:** 시사점 분석 실패")
+        else:
+            st.markdown(f"**2. 시사점:** {ai_insight}")
+            
+        st.markdown(f"[🔗 뉴스 기사 보러가기]({news['link']})")
         st.write("---")
 
 with col2:
@@ -107,12 +107,27 @@ with col2:
     data_news = get_news("데이터 분석")
     
     for i, news in enumerate(data_news):
-        with st.spinner(f"AI가 {i+1}번 기사 문맥 분석 중..."):
-            ai_summary, ai_insight = analyze_news(news['title'], news['raw_summary'], gemini_api_key)
+        # ⚠️ PDF 요구사항: 기사 번호와 제목을 대제목 형태로 먼저 배치
+        st.markdown(f"### {news['title']}")
+        
+        with st.spinner(f"AI가 요약문 생성 중..."):
+            summary_prompt = "이 기사의 핵심 사건과 사실 관계를 2~3문장으로 명확하게 요약해줘."
+            ai_summary = ask_gemini(news['title'], news['raw_summary'], summary_prompt, gemini_api_key)
             
-        st.markdown(f"### 기사 {i+1}")
-        st.markdown(f"**1. 제목:** {news['title']}")
-        st.markdown(f"**2. 요약:** {ai_summary}")
-        st.markdown(f"**3. 시사점:** {ai_insight}")
-        st.markdown(f"**4. 링크:** [🔗 뉴스 기사 보러가기]({news['link']})")
+        with st.spinner(f"AI가 시사점 분석 중..."):
+            insight_prompt = "이 뉴스가 관련 시장, 기술 트렌드, 혹은 실무자에게 주는 의미나 시사점을 2~3문장으로 날카롭게 분석해줘."
+            ai_insight = ask_gemini(news['title'], news['raw_summary'], insight_prompt, gemini_api_key)
+            
+        # ⚠️ PDF 요구사항에 맞춤 포맷 출력 (1. 요약 / 2. 시사점 / 링크)
+        if "실패" in ai_summary:
+            st.markdown(f"**1. 요약:** 요약 생성 {ai_summary}")
+        else:
+            st.markdown(f"**1. 요약:** {ai_summary}")
+            
+        if "실패" in ai_insight:
+            st.markdown(f"**2. 시사점:** 시사점 분석 실패")
+        else:
+            st.markdown(f"**2. 시사점:** {ai_insight}")
+            
+        st.markdown(f"[🔗 뉴스 기사 보러가기]({news['link']})")
         st.write("---")
